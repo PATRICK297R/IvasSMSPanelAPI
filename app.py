@@ -8,35 +8,28 @@ from bs4 import BeautifulSoup
 import logging
 import os
 import gzip
-from io import BytesIO
 import brotli
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class IVASSMSClient:
-    def __init__(self):
+    def __init__(self, email=None, password=None):
         self.scraper = cloudscraper.create_scraper()
         self.base_url = "https://www.ivasms.com"
         self.logged_in = False
         self.csrf_token = None
+        self.email = email or os.getenv("IVASMS_EMAIL")
+        self.password = password or os.getenv("IVASMS_PASSWORD")
         
         self.scraper.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
         })
 
     def decompress_response(self, response):
-        """Decompress response content if encoded with gzip or brotli."""
         encoding = response.headers.get('Content-Encoding', '').lower()
         content = response.content
         try:
@@ -51,70 +44,39 @@ class IVASSMSClient:
             logger.error(f"Error decompressing response: {e}")
             return response.text
 
-    def load_cookies(self, file_path="cookies.json"):
+    def login_with_password(self):
         try:
-            if os.getenv("COOKIES_JSON"):
-                cookies_raw = json.loads(os.getenv("COOKIES_JSON"))
-                logger.debug("Loaded cookies from environment variable")
-            else:
-                with open(file_path, 'r') as file:
-                    cookies_raw = json.load(file)
-                    logger.debug("Loaded cookies from file")
-            
-            if isinstance(cookies_raw, dict):
-                logger.debug("Cookies loaded as dictionary")
-                return cookies_raw
-            elif isinstance(cookies_raw, list):
-                cookies = {}
-                for cookie in cookies_raw:
-                    if 'name' in cookie and 'value' in cookie:
-                        cookies[cookie['name']] = cookie['value']
-                logger.debug("Cookies loaded as list")
-                return cookies
-            else:
-                logger.error("Cookies are in an unsupported format")
-                raise ValueError("Cookies are in an unsupported format.")
-        except FileNotFoundError:
-            logger.error("cookies.json file not found")
-            return None
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON format in cookies.json")
-            return None
-        except Exception as e:
-            logger.error(f"Error loading cookies: {e}")
-            return None
+            logger.debug("Fetching login page for CSRF token...")
+            resp = self.scraper.get(f"{self.base_url}/login", timeout=10)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            token_input = soup.find("input", {"name": "_token"})
+            if not token_input:
+                logger.error("CSRF token not found on login page")
+                return False
+            token = token_input.get("value")
 
-    def login_with_cookies(self, cookies_file="cookies.json"):
-        logger.debug("Attempting to login with cookies")
-        cookies = self.load_cookies(cookies_file)
-        if not cookies:
-            logger.error("No valid cookies loaded")
-            return False
-        
-        for name, value in cookies.items():
-            self.scraper.cookies.set(name, value, domain="www.ivasms.com")
-        
-        try:
-            response = self.scraper.get(f"{self.base_url}/portal/sms/received", timeout=10)
-            logger.debug(f"Response headers: {response.headers}")
-            if response.status_code == 200:
-                html_content = self.decompress_response(response)
-                soup = BeautifulSoup(html_content, 'html.parser')
-                csrf_input = soup.find('input', {'name': '_token'})
+            payload = {
+                "_token": token,
+                "email": self.email,
+                "password": self.password
+            }
+            logger.debug("Submitting login form...")
+            login_resp = self.scraper.post(f"{self.base_url}/login", data=payload, timeout=10, allow_redirects=True)
+
+            if login_resp.status_code == 200 and "/portal" in login_resp.url:
+                logger.debug("Login successful, fetching portal page...")
+                portal = self.scraper.get(f"{self.base_url}/portal/sms/received", timeout=10)
+                portal_soup = BeautifulSoup(portal.text, "html.parser")
+                csrf_input = portal_soup.find("input", {"name": "_token"})
                 if csrf_input:
-                    self.csrf_token = csrf_input.get('value')
+                    self.csrf_token = csrf_input.get("value")
                     self.logged_in = True
-                    logger.debug(f"Logged in successfully with CSRF token: {self.csrf_token}")
+                    logger.info("Logged in successfully with email & password")
                     return True
-                else:
-                    logger.error("Could not find CSRF token. Dumping response HTML for debugging:")
-                    logger.error(f"Response HTML (first 2000 chars): {html_content[:2000]}")
-                    logger.error(f"Full response length: {len(html_content)}")
-                    return False
-            logger.error(f"Login failed with status code: {response.status_code}")
+            logger.error(f"Login failed. Status: {login_resp.status_code}, URL: {login_resp.url}")
             return False
         except Exception as e:
-            logger.error(f"Login error: {e}")
+            logger.error(f"Login error: {e}", exc_info=True)
             return False
 
     def check_otps(self, from_date="", to_date=""):
@@ -322,11 +284,14 @@ class IVASSMSClient:
         return all_otp_messages
 
 app = Flask(__name__)
-client = IVASSMSClient()
+client = IVASSMSClient(
+    email="mlbbku1922@gmail.com",      # ganti sesuai akun
+    password="akmal999"               # ganti sesuai akun
+)
 
 with app.app_context():
-    if not client.login_with_cookies():
-        logger.error("Failed to initialize client with cookies")
+    if not client.login_with_password():
+        logger.error("Failed to initialize client with email & password")
 
 @app.route('/')
 def welcome():
@@ -344,47 +309,35 @@ def get_sms():
     limit = request.args.get('limit')
     
     if not date_str:
-        return jsonify({
-            'error': 'Date parameter is required in DD/MM/YYYY format'
-        }), 400
+        return jsonify({'error': 'Date parameter is required in DD/MM/YYYY format'}), 400
     
     try:
         parsed_date = datetime.strptime(date_str, '%d/%m/%Y') 
         from_date = date_str
         to_date = request.args.get('to_date', '')
         if to_date:
-            datetime.strptime(to_date, '%d/%m/%Y')  
+            datetime.strptime(to_date, '%d/%m/%Y')
     except ValueError:
-        return jsonify({
-            'error': 'Invalid date format. Use DD/MM/YYYY'
-        }), 400
+        return jsonify({'error': 'Invalid date format. Use DD/MM/YYYY'}), 400
 
     if limit:
         try:
             limit = int(limit)
             if limit <= 0:
-                return jsonify({
-                    'error': 'Limit must be a positive integer'
-                }), 400
+                return jsonify({'error': 'Limit must be a positive integer'}), 400
         except ValueError:
-            return jsonify({
-                'error': 'Limit must be a valid integer'
-            }), 400
+            return jsonify({'error': 'Limit must be a valid integer'}), 400
     else:
         limit = None
 
     if not client.logged_in:
-        return jsonify({
-            'error': 'Client not authenticated'
-        }), 401
+        return jsonify({'error': 'Client not authenticated'}), 401
     
     logger.debug(f"Fetching SMS for date range: {from_date} to {to_date or 'empty'} with limit {limit}")
     result = client.check_otps(from_date=from_date, to_date=to_date)
     
     if not result:
-        return jsonify({
-            'error': 'Failed to fetch OTP data'
-        }), 500
+        return jsonify({'error': 'Failed to fetch OTP data'}), 500
 
     otp_messages = client.get_all_otp_messages(result.get('sms_details', []), from_date=from_date, to_date=to_date, limit=limit)
     
